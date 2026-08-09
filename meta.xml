@@ -1,0 +1,6 @@
+<root>
+  <id>wotstat.spotting</id>
+  <version>{{VERSION}}</version>
+  <name>wotstat.spotting</name>
+  <description>Spotting utilities by Silhouette (Inspired by WotStat)</description>
+</root>
