@@ -31,6 +31,8 @@ _PORT_COLORS = {
 }
 _CHECKPOINT_SIZE = 0.15  # meters, cube edge length
 _PORT_SIZE = 0.22
+_STATS_LABEL_COLOR = 0xFFFFFFFF  # white
+_STATS_LABEL_HEIGHT_OFFSET = 0.6  # meters above the anchor point, so it doesn't overlap the top checkpoint marker
 
 # Sticky flag: if label() turns out not to exist/behave as expected,
 # stop trying after the first failure instead of throwing every frame.
@@ -81,3 +83,24 @@ def render(checkpoints, ports, showLabels=False):
     _drawMarker(worldPos, _PORT_SIZE, color)
     if showLabels:
       _drawLabel(worldPos, 'port:' + name, color)
+
+
+def renderStats(anchorWorldPos, viewRange, camoPercentStationary):
+  """
+  Draws a floating text label near the vehicle showing effective view
+  range and stationary camouflage %. anchorWorldPos is typically
+  checkpoints['top'] -- the label is offset above it so it doesn't
+  overlap that marker. Shown whenever the overlay is on, independent of
+  showLabels (this is core information, not per-marker debug clutter).
+
+  Camo is explicitly labeled "(min)" -- see core/stats.py's module
+  docstring and NOTES.md section 21: this can only ever be a same-or-
+  lower estimate of the vehicle's true camo (missing bush/foliage
+  bonus always, and some optional devices' bonuses depending on the
+  device), never an exact or over-stated figure.
+  """
+  viewRangeText = ('%.0fm' % viewRange) if viewRange is not None else '?'
+  camoText = ('%.0f%%+ (min)' % camoPercentStationary) if camoPercentStationary is not None else '?'
+  text = 'View: %s   Camo: %s' % (viewRangeText, camoText)
+  labelPos = Math.Vector3(anchorWorldPos[0], anchorWorldPos[1] + _STATS_LABEL_HEIGHT_OFFSET, anchorWorldPos[2])
+  _drawLabel(labelPos, text, _STATS_LABEL_COLOR)

@@ -1236,3 +1236,463 @@ This is a comprehensive summary of the technical hurdles and breakthroughs we en
     ```
 
 ---
+
+## 21. Session 5 — Phase 4 research: view range (solved) + camo % (partially solved, honest gap)
+
+User asked to skip Phase 3 (restriction gate — still not implemented,
+overlay still has zero mode gating, explicit user decision) and start
+Phase 4 (derived stats). Per `AGENTS.md`'s own caution ("derived stat
+formulas drift from actual game formulas after a patch — don't
+hardcode assumptions"), researched whether the game already computes
+combined effective values itself, rather than reimplementing the whole
+equipment+crew+perk formula from scratch.
+
+### View range — fully solved, server-authoritative, no formula needed
+
+`circularVisionRadius` (already includes base + optics/binoculars +
+crew skills + damaged-optics penalty) is pushed by the server via
+`Avatar.py:1704 syncVehicleAttrs` and cached client-side. Vanilla's own
+minimap view-range circle reads it directly:
+
+`gui/Scaleform/daapi/view/battle/shared/minimap_plugins.py:496`:
+```python
+def _calcCircularVisionRadius(self):
+    visibilityMinRadius = self._arenaVisitor.getVisibilityMinRadius()
+    vehAttrs = self.sessionProvider.shared.feedback.getVehicleAttrs()
+    return min(vehAttrs.get('circularVisionRadius', visibilityMinRadius), VISIBILITY.MAX_RADIUS)
+```
+
+So: `dependency.instance(IBattleSessionProvider).shared.feedback.getVehicleAttrs()['circularVisionRadius']`,
+with live updates available via `feedback.onVehicleFeedbackReceived`
+filtered to `FEEDBACK_EVENT_ID.VEHICLE_ATTRS_CHANGED`. Own-vehicle-only
+by construction (it's *our* synced attrs). `# TODO(api-verify)`: the
+exact import path `skeletons.gui.battle_session.IBattleSessionProvider`
+is a well-known WoT modding interface but not yet independently
+confirmed by this project's own decompile read — the *usage pattern*
+(`dependency.instance(...)`) is confirmed from
+`gui/battle_control/controllers/feedback_adaptor.py` and
+`prebattle_setups_ctrl.py:139,232`.
+
+### Camouflage % — partially solved, one real client-side limitation
+
+**No live pre-computed camo value exists.** `getVehicleAttrs()` has no
+camo key — confirmed by direct source inspection, camo spotting checks
+are server-only.
+
+What **is** available: the combined (base + paint/net + optional
+devices + crew skill) *static* camo factors, via
+`gui.shared.items_parameters.params.VehicleParams`:
+
+```python
+vehicleItem = dependency.instance(IItemsCache).items.getItemByCD(intCD)
+vehicleParams = items_params.VehicleParams(vehicleItem)
+vehicleParams.invisibilityStillFactor   # _Invisibility(current, atShot) namedtuple, already 0-100
+vehicleParams.invisibilityMovingFactor  # same shape, for while moving
+```
+Confirmed usable *during battle*, not just Garage —
+`prebattle_setups_ctrl.py:139,232` builds a `gui_items.Vehicle` and
+calls this mid-battle. `# TODO(api-verify)`: exact field shapes
+(`_Invisibility(current, atShot)`) are sourced from decompiled code
+reading, not yet exercised by this project's own live test.
+
+**Honest limitation, not fixable client-side**: bush/foliage
+concealment bonus is a server-side ray/mask system with no exposed
+client value. `camouflagePercent()` in this project can only ever
+report base+paint/net+crew+movement/fire-state camo — the same thing
+the Garage equipment-comparison screen shows — never "are you actually
+hidden in this bush right now." This should be stated plainly in the
+HUD/README once built, not implied to be more complete than it is.
+
+Formula reference (`items/utils.py:227`, `items/vehicles.py:1242`) confirms
+paint/net/crew are additive+multiplicative terms on a base
+moving/stationary pair, terrain type is NOT a camo factor (it affects
+mobility, not visibility), and firing applies a separate
+`invisibilityFactorAtShot` multiplier. The public wiki's formula
+(`wiki.wargaming.net/en/Battle_Mechanics` §6.6.1) is stale relative to
+current code — decompiled source is authoritative here, not the wiki.
+
+### Applied this session
+
+`core/stats.py` (new): `getEffectiveViewRange()` (high confidence,
+single pre-computed value) and `getCamouflagePercentStationary(vehicle)`
+(first pass — always reports the *stationary* value regardless of
+actual movement/firing state, clearly named as such; moving/at-shot
+switching is a follow-up once this base pipeline is confirmed live).
+Every new API call here (`dependency.instance`, `IBattleSessionProvider`,
+`IItemsCache`, `VehicleParams` field shapes) is unconfirmed by this
+project's own testing — much higher uncertainty than `core/transform.py`
+ever had. Wired a one-shot **F6** keybind in `WotstatSpotting.py` that
+logs both values on press, rather than continuous per-frame rendering,
+specifically because of that uncertainty stack — verify via log first,
+same pattern that worked for the checkpoint formula, before trusting
+this enough to render.
+
+**Ask**: press F6 in a Training Room, check the log for
+`effective view range: ...` and `camouflage % (stationary): ...` lines
+— report back whether they print real numbers, `None`, or an exception.
+
+**Follow-up fix, same session**: the unconfirmed imports
+(`dependency`, `skeletons.gui.battle_session`,
+`skeletons.gui.shared.utils`, `gui.shared.items_parameters.params`)
+were initially at `core/stats.py` module load time. That's a real
+blast-radius risk this project hasn't taken before: if any of those
+imports are wrong, `import core.stats` itself fails, which cascades up
+through `WotstatSpotting.py`'s top-level `from core import stats` and
+would break `init()` entirely -- taking the already-confirmed-working
+F4 checkpoint overlay down with it, not just the new stats feature.
+Moved every unconfirmed import inside its function, wrapped in the
+existing try/except -- a stats API failure now only returns `None`
+from that one function, same failure mode as everything else in this
+file.
+
+### F6 test result: `dependency` import wrong, same bug pattern as `model_assembler`
+
+```
+getEffectiveViewRange error: No module named dependency
+_getVehicleItem error: No module named dependency
+```
+
+Same class of bug as section 14's `model_assembler` fix: guessed a
+top-level module name, it's actually nested under a package. Research
+against the `2.3.1_EU` branch specifically (not a generic/other-version
+reference this time) found the real import, and cross-checked it
+against this machine's own `res/packages/scripts.pkg`:
+
+```python
+from helpers import dependency          # NOT top-level `dependency`
+from skeletons.gui.battle_session import IBattleSessionProvider  # this one was already correct
+from skeletons.gui.shared import IItemsCache  # NOT skeletons.gui.shared.utils (that package only has `requesters`)
+```
+
+Confirmed present client-side in `scripts.pkg`:
+`scripts/client/helpers/dependency.pyc`,
+`scripts/client/skeletons/gui/battle_session.pyc`,
+`scripts/client/skeletons/gui/shared/__init__.pyc`. No top-level
+`scripts/client/dependency.pyc` exists — exactly why the guess failed.
+Verbatim usage confirmed in WG's own shipped code,
+`gui/battle_control/battle_ctx.py:157`:
+`sessionProvider = dependency.instance(IBattleSessionProvider)`.
+
+Also: `feedback_adaptor.py` (cited in this project's earlier research
+as an `IBattleSessionProvider` usage example) turned out to have no
+`dependency` import at all in this branch — a bad reference file from
+the earlier research pass. Worth remembering: a class/interface being
+*mentioned* in a file doesn't mean that file shows the correct import
+pattern for it.
+
+Applied: `core/stats.py` updated to the corrected import paths (still
+inside the deferred, per-function try/except pattern). `intCD =
+vehicle.typeDescriptor.type.compactDescr` and the exact
+`VehicleParams.invisibilityStillFactor` shape remain genuinely
+unconfirmed (`# TODO(api-verify)`) — next F6 test will show whether
+those are also wrong, or whether view range / camo now actually
+resolve.
+
+### F6 retest: CONFIRMED WORKING, both values resolve cleanly
+
+```
+effective view range: 446
+camouflage % (stationary): 21.1469995379
+```
+
+Reproduced identically on a second F6 press. No exceptions from either
+function — the `helpers.dependency` / `skeletons.gui.shared`
+`IItemsCache` fix (above) was the complete fix; `compactDescr` and
+`invisibilityStillFactor`'s shape turned out to be correct guesses
+too. Both APIs in `core/stats.py` are now live-confirmed, same
+confidence level as `core/transform.py`.
+
+**Camo number sanity check**: user's screenshot showed the vehicle
+parked in/behind a bush, and expected ~50% vs. the displayed 21%. This
+is very likely explained by the already-documented bush limitation
+(this section, "Camouflage % — partially solved"): `21.1%` is
+base+equipment+crew+stationary camo *without* bush bonus, and bush
+concealment is typically a large additional multiplier applied
+server-side with no client-exposed value. Not yet independently
+confirmed (would need a clean in-the-open retest compared against the
+Garage equipment-comparison screen's number for the same loadout), but
+consistent with everything already established about this limitation
+— not treated as a new bug.
+
+### Applied: visual display
+
+`core/overlay.py`: new `renderStats(anchorWorldPos, viewRange,
+camoPercentStationary)` — draws a `View: 446m   Camo: 21% (no bush)`
+style label above the vehicle (offset above `checkpoints['top']`),
+reusing the same confirmed `_drawLabel()`/`DebugDrawer.label()`
+mechanism from section 20. The "(no bush)" qualifier is baked into the
+displayed text itself, not just code comments, so it's not misleading
+in-game. Shown whenever the main overlay (F4) is on, independent of the
+F5 per-marker labels toggle -- this is core information, not per-marker
+debug clutter.
+
+`WotstatSpotting.py`: stats are now computed on a throttled cache
+(refreshed every 30 frames, ~0.5s at 60fps, plus immediately on the
+first frame after toggling on) rather than every single frame, since
+the DI/items-cache lookups in `core/stats.py` are heavier than the
+checkpoint geometry math and don't need per-frame precision -- view
+range and camo don't change every tick. `renderStats()` itself (a
+cheap draw call) still runs every frame using the cached values, so
+the label doesn't visibly lag behind the marker positions.
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass.
+
+**CONFIRMED LIVE**: stats label renders correctly above the vehicle
+("View: 44m   Camo: 21% (no bush)"), and view range visibly updates
+with module crits — direct confirmation `getEffectiveViewRange()`
+tracks live, real state, not a cached/stale value.
+
+**Camo was actually wrong, and the bush theory was wrong too.** User
+compared against the Garage "ABOUT VEHICLE" screen for the *same*
+vehicle, same loadout: Concealment showed **52.87%** stationary vs.
+our **21.15%** — and confirmed the number didn't change with terrain at
+all (ruling out "it's just missing bush bonus," since that would still
+leave the base number matching Garage's no-bush display).
+
+### Root cause: `getItemByCD` returns a fake, unsynced item in battle
+
+Researched with the same "check the exact decompiled source, don't
+reuse a claim from a different context" discipline as the
+`model_assembler`/`dependency` fixes. Confirmed in
+`client/gui/shared/gui_items/vehicle.py`: `Vehicle.__init__` gates
+*all* live state (crew, camo paint, consumables) behind an
+inventory-sync check (`vehicle.py:304`). In battle that check fails
+(no synced Garage inventory for this item), so:
+- `initCrew` yields an empty crew, backfilled by
+  `createFakeTankmanDescr(role, vehicleType, roleLevel=100)`
+  (`items_parameters/functions.py:219,225`) — **100% qualification,
+  zero trained skills, no perks** (no Camouflage skill, no BiA).
+- `_outfitComponents` stays empty → `getBonusCamo()` returns `None` →
+  **no camo paint bonus**.
+- `_invData` stays empty → **no consumables/food/boosters**.
+
+That combination — real vehicle, fake empty-skill crew, no paint, no
+food — is exactly the gap between 52.87% (real) and 21.15% (what a
+"clean" crew with just base equipment would show). `VehicleParams`
+itself is fully capable of factoring all of this in — the bug was
+never in the formula, it was in what item we fed it.
+
+### Fix: read directly from the live vehicle entity, not a Garage item lookup
+
+Same category of fix as trusting `vehicle.typeDescriptor` over any
+Garage-inventory API for the checkpoint geometry. Confirmed the live
+vehicle entity replicates real data for the player's own vehicle:
+`entity_defs/vehicle.def:144` — `crewCompactDescrs`, `DetailLevel
+MY_VEHICLE` (i.e. only sent for your own vehicle, consistent with the
+project's own-vehicle-only architecture). Camo comes from
+`vehicle.publicInfo.outfit`.
+
+```python
+vehicleDescr = vehicle.typeDescriptor
+crewCompactDescrs = list(vehicle.crewCompactDescrs)  # real skills/perks
+
+sessionProvider = dependency.instance(IBattleSessionProvider)
+eqs = [item.getDescriptor() for item in sessionProvider.shared.equipments.getEquipments().values() if item is not None]
+
+factors = vehicleAttributeFactors()
+items_utils.updateAttrFactorsWithSplit(vehicleDescr, crewCompactDescrs, eqs, factors)
+
+camouflageId = None
+outfitComponent = camouflages.getOutfitComponent(vehicle.publicInfo.outfit, vehicleDescr)
+for camo in outfitComponent.camouflages:
+  if camo.appliedTo & ApplyArea.HULL:
+    camouflageId = camo.id
+    break
+
+baseInvisibility = vehicleDescr.computeBaseInvisibility(factors['camouflage'], camouflageId)
+factors['invisibility'] = factors['invisibility'][VEHICLE_TTC_ASPECTS.WHEN_STILL]
+stillPercent = items_utils.getInvisibility(vehicleDescr, factors, baseInvisibility, False) * 100.0
+```
+
+`items_utils.updateAttrFactorsWithSplit` is the confirmed "assembler"
+function — same one `VehicleParams` itself calls internally
+(`params.py:1076-1081`), just fed real crew/equipment data instead of
+the fake item's empty data. `computeBaseInvisibility` returns a
+`(moving, still)` tuple; `getInvisibility(..., isMoving=False)` selects
+index 1. This is `getVehicleFactors`'s Garage-default behavior
+(`isModifySkillProcessors=False`), matching the 52.87% figure rather
+than the in-battle-recalculated variant.
+
+**Bush limitation is unchanged** — this formula still has no terrain
+awareness (same underlying `getInvisibility` function, no map/position
+input at all), so the "(no bush)" label stays accurate and necessary.
+
+Applied to `core/stats.py`: `_getVehicleItem`/`VehicleParams`/
+`IItemsCache` path removed entirely, replaced with the above. Every API
+in this new path is sourced with file:line citations from the
+`2.3.1_EU` decompile but **not yet exercised by this project's own live
+test** — next F6/visual check will confirm whether it actually resolves
+to something near 52.87%, or surfaces a next wrong guess (e.g.
+`sessionProvider.shared.equipments` or `camouflages.getOutfitComponent`
+signatures).
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass.
+
+**CONFIRMED LIVE, real progress but not exact yet**: computed 44%,
+Garage shows 52.87% for the same vehicle/loadout, no errors logged. Up
+from 21% before this fix, but ~9 points still unexplained. Ruled out
+bush again (this test happened while parked in a bush; the "(no bush)"
+value should be terrain-independent either way, and both numbers are
+meant to be the no-bush baseline).
+
+### Follow-up research: two leads, one ruled out, one uncertain
+
+- **`additionalCrewLevelIncrease` (food skill-boost argument) — ruled
+  out.** Confirmed: it's `0.0` unless a `situationalBonuses` list is
+  explicitly passed, which only happens in crew-comparison *tooltips*,
+  never in normal stat display. The Garage's own 52.87% figure is
+  computed the same way this project's code already does (omitting
+  it). Not the gap.
+- **Food/consumables reach the crew through the equipment descriptor
+  itself** (`eq.crewLevelIncrease` summed in `updateVehicleAttrFactors`),
+  not a separate argument — so as long as the right items are in `eqs`,
+  food is already covered by the existing code shape.
+- **Confirmed: optional devices (camo net etc.) are already baked into
+  `vehicleDescr` and must NOT be added to `eqs`** — doing so would
+  double-count them. Good, this project's code doesn't add them.
+- **Uncertain (medium confidence): `sessionProvider.shared.equipments`
+  may only return "regular" battle consumables (repair kit, med kit,
+  food) and structurally exclude `battleBoosters` (crew-skill
+  directives)** — those can meaningfully move camo and aren't reachable
+  from any battle-side controller this research found. This is the
+  leading theory for the remaining ~9 points, but not proven.
+- The research's own suggested fix (route back through
+  `IItemsCache.items.getItemByCD(...)` + `getVehicleFactors(guiVeh)` to
+  pick up boosters) was **not applied** — it risks reintroducing the
+  exact unsynced-item/fake-crew problem this session already diagnosed
+  and fixed above. Applying it without checking would be trading a
+  known-fixed bug for a maybe-fixed one.
+
+**Chose diagnosis over another guess.** Added
+`stats.getCamouflageDebugSnapshot(vehicle)` (diagnostic-only, mirrors
+`transform.getDebugSnapshot`) exposing `factors['crewLevelIncrease']`,
+`factors['camouflage']`, the raw `factors['invisibility']` tuple, the
+names of items actually in `eqs`, and
+`vehicleDescr.optionalDevices` names. Wired into F6's log output,
+right after the existing view-range/camo lines. This directly answers
+whether food/consumables are actually present in `eqs` (if food is
+missing, that's the gap; if it's present with a sane
+`crewLevelIncrease` and the gap persists, the booster theory gets more
+likely) — real numbers instead of a fourth speculative rewrite.
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass. **Not yet verified live.**
+
+**Status check-in point**: this is the third research/fix round on
+camouflage specifically. 44% (mechanically correct pipeline, honest
+"(no bush)" label, food/net not double-counted) may be an acceptable
+place to stop chasing exactness, depending on how much precision this
+project actually needs here — worth an explicit decision with the user
+rather than continuing to iterate indefinitely, especially if the next
+debug snapshot doesn't cleanly point to a fix.
+
+### F6 debug-snapshot result: pinpointed the exact missing device
+
+User did excellent diagnostic work independently: compared the Garage
+"Configuration" screen with Low Noise Exhaust System equipped
+(52.87%) vs. removed (43.87%) — matching this project's computed 44%
+almost exactly to the "without" case. `eqNames = ['smallMedkit',
+'hotCoffee', 'smallRepairkit']` (no Low Noise Exhaust) and
+`optionalDeviceNames = []` (empty) confirmed neither data source this
+project was reading captured the device at all.
+
+### Fourth research round: root cause found, with exact arithmetic proof
+
+`additionalInvisibilityDevice` (Low Noise Exhaust System's internal
+name) is `ITEM_TYPES.optionalDevice` — a different item type than
+`ITEM_TYPES.equipment` (consumables), which is exactly why
+`shared.equipments.getEquipments()` never had it; that controller only
+serves the consumables type. Its bonus is applied via
+`LowNoiseTracks.updateVehicleDescrAttrs()`
+(`items/artefacts.py:509`) directly into
+`vehicleDescr.miscAttrs['invisibilityAdditiveTerm']` — not into
+`factors`, so `applyOptDevFactorsForAspect` alone would never surface
+it either.
+
+**Verified by exact arithmetic against both observed numbers** — EBR
+105's base still-invisibility is `0.371`
+(`item_defs/vehicles/france/F108_Panhard_EBR_105.xml:18`), and the
+device's `invisibilityBonus` is `0.06`/`0.08` (regular/improved slot):
+```
+without: (0.371 + 0.019) * 1.125 = 0.43875 -> 43.87%  <- matches Garage exactly
+with:    (0.371 + 0.019 + 0.08) * 1.125 = 0.52875 -> 52.87%  <- matches Garage exactly
+```
+Not a plausible guess — an exact match to two independently-observed
+numbers from two different UI screens.
+
+`vehicleDescr.miscAttrs['invisibilityAdditiveTerm']` **is** already
+read by `items_utils.getInvisibility()` — the function this project's
+code already calls. So the bug wasn't a missing formula term, it was
+either (a) this project's manually-reconstructed call sequence somehow
+not benefiting from a value that should already be there, or (b) our
+`vehicleDescr`/`optionalDevices` genuinely not reflecting the fitted
+device for a reason the research couldn't fully pin down from source
+alone.
+
+**Fix applied**: switched from manually reassembling
+`computeBaseInvisibility()` + `getInvisibility()` + hand-picking the
+`WHEN_STILL` aspect, to the game's own purpose-built client function,
+`items.utils.getClientInvisibility(vehicleDescr, vehicle, camouflageFactor, factors)`
+— takes the live vehicle entity directly and returns `(moving, still)`.
+This is a cleaner, more "designed for this exact use case" API than
+hand-rolling the same formula, and sidesteps whatever specific mistake
+was in the manual version.
+
+`core/stats.py`'s `getCamouflageDebugSnapshot()` also now exposes
+`invisibilityAdditiveTerm`/`invisibilityBaseAdditive` directly from
+`vehicleDescr.miscAttrs`, so the next test will show directly whether
+the `0.08` device bonus is actually present on our `vehicleDescr` —
+settling (a) vs (b) above with one more log line regardless of whether
+`getClientInvisibility` alone fixes it.
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass.
+
+### F6 retest: getClientInvisibility dead end, but confirms the real cause
+
+```
+getCamouflagePercentStationary error: Type : Vehicle has no attribute: getBonusCamo
+...
+invisibilityAdditiveTerm = 0.0
+invisibilityBaseAdditive = 0.0
+```
+
+`getClientInvisibility(vehicleDescr, vehicle, ...)` internally calls
+`vehicle.getBonusCamo()` — a method that only exists on the
+Garage-style `gui_items.Vehicle` wrapper, not the raw battle entity.
+"Takes the live vehicle directly" (fourth research round's own
+description) was imprecise — it needs the *wrapper*, and this project
+already confirmed that wrapper is fake/unsynced in battle (the very
+first camo fix, earlier in this section). Dead end, reverted.
+
+**The debug snapshot settles the open question from the fix above**:
+`invisibilityAdditiveTerm`/`invisibilityBaseAdditive` are both
+genuinely `0.0` on the live `vehicleDescr`, confirming case (b) from
+the third fix's own notes — this project's `vehicleDescr` (from
+`vehicle.typeDescriptor` on the battle entity) simply does not reflect
+the fitted Low Noise Exhaust System device, for a reason four research
+rounds couldn't determine from source alone. Not a formula bug on this
+project's side; a genuine input-data gap.
+
+**Decision: stop chasing this specific device, document it as a second
+known limitation.** Reverted `getCamouflagePercentStationary()` to the
+manual `computeBaseInvisibility()`/`getInvisibility()` sequence (the
+"third fix" version, minus `getClientInvisibility`) — this is the
+correct, working formula given the data this project can actually
+access; it was never wrong, the *input* was incomplete. Updated
+`core/stats.py`'s module docstring and `core/overlay.py`'s on-screen
+label to be honest about this: camo is now framed as a **lower bound**
+("45%+ (min)" style, not "45% (no bush)") rather than implying
+precision the underlying data can't support. Two documented gaps now,
+same category as each other: bush bonus (never obtainable) and *some*
+optional devices' bonuses (obtainable in principle, but this project's
+current data source doesn't have them for at least this one confirmed
+case).
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass. **Not yet verified live** for the reverted formula + new label
+text (though the formula itself was already confirmed working at 44%
+before the `getClientInvisibility` detour, so this is mostly a
+text/framing change plus removing the broken call).
