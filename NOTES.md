@@ -248,6 +248,958 @@ it directly once Phase 2 prototyping starts.
       task from `TASKS.md` (log one checkpoint's world position each
       frame, sanity-check it in Garage) before moving to Phase 2
 
+---
+
+## 9. Session 3: probe bug fix + closure test, pending manual run
+
+**Found a real bug in the old `phase1_probe.py`**: `turr_xml` was only
+assigned inside `if section.has_key('turrets0')`, but was referenced
+unconditionally afterward for the `observerPos` check. When that branch
+didn't fire, this threw `NameError`, which the outer `try/except`
+swallowed into a generic `"Probe CRASHED: ..."` log line with no useful
+detail. This is a plausible explanation for confusing failures during
+the earlier (lost/failed) Phase 2 attempt — worth remembering: **the old
+probe's crash logs may not reflect real API failures**, just this bug.
+
+`core/phase1_probe.py` was rewritten (still throwaway diagnostic code,
+not shipped functionality) to fix this and directly attack every
+remaining open item from §7 in one pass:
+
+- Reads hull + turret `visibilityCheckPoints` and `observerPos` from the
+  vehicle's own item_defs XML (same lazy-loading workaround as before),
+  now logging **every** entry (not just implicitly the first) plus a
+  running total, to settle the "is it really 6" question.
+- Tries `child.asVector3` on each XML entry (new — the old probe only
+  ever logged `.asString`); falls back to logging the raw string if that
+  accessor doesn't exist, so the run still yields usable data either way.
+  `# TODO(api-verify)`: `.asVector3` is a guess based on the standard
+  BigWorld `DataSection` accessor family (`.asString`/`.asFloat`/
+  `.asVector3`/...), not yet confirmed against this game version.
+- Dumps `vehicle.appearance.modelsDesc.keys()` and every entry's
+  `['model'].matrix` world position — this directly answers whether
+  `modelsDesc['turret']` exists alongside the already-confirmed
+  `modelsDesc['hull']`.
+- Searches compound-model nodes `hull`, `turret`, `turret0`, `gun`,
+  `HP_turretJoint`, `HP_gunJoint` (expanded from the original 4) and
+  logs each one found/not-found.
+- Projects every parsed local offset into world space via
+  `matrix.applyPoint(localOffset)` (the formula from §8) using whichever
+  hull/turret matrix was found (node search preferred, `modelsDesc` as
+  fallback), and logs the result — this is the actual "sanity check
+  against known tank geometry" step `TASKS.md` Phase 1 asks for.
+
+Also fixed in `WotstatSpotting.py`: added the singleton/double-init
+guard described in §8 (`g_probeStarted` global flag), since without it
+a double module load would run the whole probe twice and interleave
+duplicate log output, which would make the log genuinely hard to read
+correctly.
+
+Also fixed: `utils/combat.py` was a typo — `TASKS.md` Phase 0 calls for
+`utils/compat.py`. Renamed via `git mv`, no content yet (still an empty
+placeholder per the original Phase 0 task).
+
+Verified locally (no game client involved): Python 2 syntax
+(`python2 -m py_compile`) passes on the changed files, and
+`./build.sh -v 0.0.3 -d` packages a `.wotmod`/`.mtmod` successfully
+end-to-end. **Not yet verified**: whether the probe's API calls actually
+work at runtime — that requires the game client, which this environment
+doesn't have.
+
+### What to do next (manual, in the game client)
+
+1. `./build.sh -v <next-version> -d`, install to
+   `Tanki/mods/<GAME_VERSION>/`, launch, open Garage with any vehicle
+   selected.
+2. Watch the log for the `===== Phase 1: Deep Extraction Started =====`
+   block (fires automatically ~2s after Garage loads, via
+   `poll_for_probe`).
+3. Report back (or paste into this file under a new dated entry):
+   - Did `hull visibilityCheckPoints` and `turret visibilityCheckPoints`
+     both print entries, and do they sum to 6?
+   - Did `asVector3 FAILED` appear for any entry? If so, the raw-string
+     fallback lines are what we fall back to parsing instead.
+   - What did `modelsDesc keys:` print — does `'turret'` appear?
+   - Which of the `node[...]` lines say `NOT FOUND` vs. print a
+     plausible-looking world position?
+   - Do the `World-space projection` lines print sane coordinates (i.e.
+     roughly on/near the tank, not far off-map — that's the
+     "double transformation" trap from §8), or do they error out?
+4. Once all of §7's open items are answered from real log output, mark
+   Phase 1 fully done and move to Phase 2 (`core/geometry.py`,
+   `core/transform.py`) using the *now-confirmed* accessor names instead
+   of the current guesses.
+
+---
+
+## 10. Session 3, first real in-game log — Pattern A confirmed, XML schema assumption wrong
+
+Ran during a battle load (log shows `BattleSpace()`, `OwnVehicle
+initialUpdate`, `battleVehicleMarkersApp.swf` — not Garage). Vehicle:
+`china:Ch29_Type_62C_prot`.
+
+**CONFIRMED — the hard problem from Phase 1 is solved:**
+`vehicle.appearance.compoundModel.node(name)` wrapped in `Math.Matrix(...)`
+returns plausible, sane world-space positions for **all** of `hull`,
+`turret`, `gun`, `HP_turretJoint`, `HP_gunJoint` (`turret0` correctly
+not found — `turret` is the real name). Concretely:
+
+```
+node[hull]           world pos: (0.000, 0.909, 0.000)
+node[turret]         world pos: (0.000, 1.410, 0.081)
+node[gun]            world pos: (0.002, 1.749, 1.105)
+node[HP_turretJoint] world pos: (0.000, 1.410, 0.081)
+node[HP_gunJoint]    world pos: (0.002, 1.749, 1.105)
+```
+
+This is Pattern A from section 2, now confirmed end-to-end on a live
+entity, not just from reading other mods' source. **This is the
+recommended approach going into Phase 2** for both the hull and turret
+world matrices — no need for `modelsDesc` or raw hull-matrix + manual
+offset math.
+
+**DEAD — drop Pattern C:** `vehicle.appearance.modelsDesc` does not
+exist on this game version's `CompoundAppearance`
+(`'CompoundAppearance' object has no attribute 'modelsDesc'`). The
+external source that described `modelsDesc['hull']` was for an older
+client. Don't spend more time on this pattern.
+
+**NEW PROBLEM — raw XML schema assumption from section 1 appears wrong
+(or this vehicle is atypical):** `section.has_key('hull')` and
+`section.has_key('turrets0')` both returned `False` with no error (the
+XML file itself opened fine at
+`scripts/item_defs/vehicles/china/Ch29_Type_62C_prot.xml`) — so
+`visibilityCheckPoints`/`observerPos` never got parsed, count=0 across
+the board. The `StranikS-Scan/WorldOfTanks-Decompiled` `1.16` branch
+class definition this was based on may not match the live client's
+actual per-vehicle XML layout, or checkpoints for this specific vehicle
+aren't hand-authored at all — this looks like the "Bounding Box
+Fallback" scenario predicted in section 8 (engine derives hull
+checkpoints from `descr.chassis.topRightCarryingPoint` when XML data is
+absent), which is exactly why this session's probe update added a
+direct dump of `descr.chassis.topRightCarryingPoint` plus a raw
+`section.keys()` dump of the actual XML schema, and a re-check of
+`descr.visibilityCheckPoints`/`observerPosOnChassis`/
+`observerPosOnTurret` directly (the earlier "Ghost Attribute" finding
+was from Garage; this run is the first one during an actual battle,
+where the lazy-loading theory says they might resolve).
+
+**Not yet answered — rerun needed with the updated probe** (this
+session's `phase1_probe.py` changes came *after* the log above, so none
+of the following showed up in it yet):
+- What are the real top-level keys in the per-vehicle XML root, and in
+  the first `turrets0` entry?
+- Does `descr.chassis.topRightCarryingPoint` return real values (Bounding
+  Box Fallback theory)?
+- Do `descr.visibilityCheckPoints` / `descr.observerPosOnChassis` /
+  `descr.observerPosOnTurret` resolve to non-`None` now that this is a
+  battle context instead of Garage?
+
+**Also worth clarifying**: this test ran during a battle, not Garage —
+worth confirming whether it was a Training Room (fine) or a competitive
+mode (not fine to leave unrestricted going forward, since
+`utils/restriction.py` has no gating logic yet — this is a Phase 3 gap,
+not a bug in this session's changes, but worth being deliberate about
+which modes get used for manual testing until the gate exists).
+
+---
+
+## 11. Session 3, second log (Training Room, confirmed) — schema mystery resolved, new dead end found
+
+Confirmed Training Room. Same vehicle. This run used the updated probe
+from section 10, so it directly answers the outstanding questions.
+
+**CONFIRMED — `visibilityCheckPoints`/`observerPos` are not a nesting
+problem, they genuinely don't exist in this vehicle's XML.** The dumped
+root keys are:
+
+```
+['xmlns:xmlref', 'crew', 'supplySlots', 'postProgressionTree',
+ 'customRoleSlotOptions', 'speedLimits', 'invisibility',
+ 'optDevsOverrides', 'repairCost', 'camouflage', 'hull', 'chassis',
+ 'turrets0', 'engines', 'fuelTanks', 'radios',
+ 'clientAdjustmentFactors', 'crewXpFactor', 'physics', 'effects',
+ 'emblems']
+```
+
+`hull` and `turrets0` **are** present at the top level (so the earlier
+`has_key` check itself works fine) — the `hull` section was
+successfully opened, it simply has no `visibilityCheckPoints` or
+`observerPos` child. Same for the `turrets0[0]` section, whose full key
+list is:
+
+```
+['userString', 'tags', 'level', 'price', 'notInShop', 'armor',
+ 'primaryArmor', 'weight', 'maxHealth', 'rotationSpeed',
+ 'turretRotatorHealth', 'circularVisionRadius',
+ 'surveyingDeviceHealth', 'guns', 'models', 'hitTester', 'gunPosition',
+ 'wwturretRotatorSoundManual', 'physicsShape', 'customizationSlots',
+ 'customization', 'camouflage']
+```
+
+**Conclusion: this game version's item_defs XML does not hand-author
+spotting checkpoints/observer positions at all.** The
+`StranikS-Scan/WorldOfTanks-Decompiled` `1.16` reference this project's
+Phase 1 started from is stale on this specific point for the current
+client. Section 1's "confirmed" claim needs a correction flag — the
+*fields exist as `VehicleDescriptor.__slots__`* is still presumably
+true (that's a Python class definition, separate from the XML content),
+but *this vehicle's XML source data for them* does not exist.
+
+**CONFIRMED — Bounding Box Fallback is real and returns usable data:**
+
+```
+descr.chassis.topRightCarryingPoint: (1.20235, 1.74121)
+```
+
+A real `(halfWidth, halfLength)`-shaped 2-vector, not `None`. This is
+the first concrete, non-`None`, non-hardpoint number this project has
+gotten for chassis extents, and matches section 8's fallback theory.
+
+**DEAD END (for now) — the "Ghost Attributes" don't resolve in battle
+either:** `descr.visibilityCheckPoints`, `descr.observerPosOnChassis`,
+`descr.observerPosOnTurret` were all still `None`, checked ~1 second
+after spawning in a Training Room. The "lazy loading, resolves once the
+server triggers a spotting check" theory from section 8 is not
+confirmed by this — either it needs an actual spotting event to occur
+first (not just being alive in battle), or these attributes are never
+populated client-side for the owning player's own vehicle at all (there
+would be no reason for the server to send a player their own spotting
+checkpoints via this mechanism — it's plausible this attribute path is
+specifically for *processing* spotting checks against other vehicles,
+not for self-inspection). Don't keep polling this path hoping it
+resolves; it's not the way to get our own vehicle's checkpoints.
+
+**Compound node search — unchanged and stable across both runs**, same
+values as section 10. Confirms Pattern A is solid, not a one-off fluke.
+
+### Updated §7 status
+
+- [x] Confirm all 6 `visibilityCheckPoints` entries — **answered
+      differently than expected**: there are no hand-authored entries
+      to count. Checkpoints must be derived (bounding-box math), not
+      read.
+- [x] `observerPosOnChassis`/`observerPosOnTurret` mapping — **answered**:
+      neither raw XML nor `typeDescriptor` exposes them on this client.
+      Needs a derived/fallback approach or a different data source
+      entirely (see open item below).
+- [x] `modelsDesc['turret']` — **moot**, `modelsDesc` doesn't exist on
+      this client at all (section 10). Pattern A (node lookup) is the
+      confirmed approach for both hull and turret world matrices.
+- [ ] **NEW open item**: find the actual formula/documentation for
+      deriving the 5 hull checkpoints from `topRightCarryingPoint`
+      (half-width/half-length), and find where the 2 view-range-port
+      local offsets should come from given neither XML nor
+      `typeDescriptor` has them on this client. This is now the one
+      real blocker left before Phase 2 can start for real — likely
+      needs public spotting-mechanics documentation (community wikis)
+      rather than more client-side probing, since the client-side data
+      sources have been exhausted.
+- [ ] Still open: whether the turret-mounted checkpoint(s)/port track
+      turret rotation live via the same `node('turret')` matrix, or
+      need the `gun`/`HP_gunJoint` matrix instead — can't test until
+      the local offsets themselves are known.
+
+---
+
+## 12. Session 3 web research — the exact engine formula, CONFIRMED BY CODE
+
+Two independent code sources, not just descriptions:
+- This project's own client, decompiled from the shipped
+  `scripts.pkg` (`scripts/common/items/vehicles.pyc`).
+- Public: `StranikS-Scan/WorldOfTanks-Decompiled`, branch `1.42`,
+  `source/res/scripts/common/items/vehicles.py`, `VehicleDescriptor.__initAttrs__`.
+
+Both show identical logic. **This settles why `typeDescriptor.visibilityCheckPoints`/`observerPos*` are `None` on the client**: the assignment is guarded by `if IS_CELLAPP or IS_UE_EDITOR:` — i.e. this whole block only runs server-side (cell app) or in the UE editor, never on a live game client. Section 11's "dead end" conclusion is now explained, not just observed.
+
+```python
+hullPos = self.chassis.hullPosition
+hullBboxMin, hullBboxMax, _ = self.hull.hitTester.bbox
+turretPosOnHull = self.hull.turretPositions[0]
+turretLocalTopY = max(hullBboxMax.y, turretPosOnHull.y + self.turret.hitTester.bbox[1].y)
+gunPosition = self.turret.gunPosition
+gunPosOnHull = turretPosOnHull + gunPosition
+hullLocalCenterY = (hullBboxMin.y + hullBboxMax.y) / 2.0
+hullLocalPt1 = Vector3(0.0, hullLocalCenterY, hullBboxMax.z)
+hullLocalPt2 = Vector3(0.0, hullLocalCenterY, hullBboxMin.z)
+hullLocalCenterZ = (hullBboxMin.z + hullBboxMax.z) / 2.0
+hullLocalPt3 = Vector3(hullBboxMax.x, gunPosOnHull.y, hullLocalCenterZ)
+hullLocalPt4 = Vector3(hullBboxMin.x, gunPosOnHull.y, hullLocalCenterZ)
+self.visibilityCheckPoints = (
+ Vector3(0.0, hullPos.y + turretLocalTopY, 0.0),   # 1: highest point, on centreline
+ hullPos + gunPosOnHull,                            # 2: gun mount point
+ hullPos + hullLocalPt1,                            # 3: front face centre, hull mid-height
+ hullPos + hullLocalPt2,                            # 4: rear face centre, hull mid-height
+ hullPos + hullLocalPt3,                            # 5: right face centre, at GUN height
+ hullPos + hullLocalPt4)                            # 6: left face centre, at GUN height
+self.observerPosOnChassis = Vector3(0, hullPos.y + turretLocalTopY, 0)
+self.observerPosOnTurret = gunPosition
+```
+
+Notes on reading this:
+- **Not** "4 bbox corners + centre" as guessed in section 10. It's:
+  top-centre (tallest point), gun mount, front/rear face centres at
+  **hull mid-height**, left/right face centres at **gun height** — the
+  left/right pair intentionally uses a different height than
+  front/rear.
+- `observerPosOnChassis` == checkpoint 1 (top-centre) exactly — not a
+  "commander's hatch" position, just the tallest collision point on the
+  centreline.
+- `observerPosOnTurret` == `turret.gunPosition` verbatim, in
+  **turret-local** space — confirms the TASKS.md assumption that this
+  port tracks turret rotation (project via the `turret` node matrix,
+  not `hull`).
+- All the inputs (`chassis.hullPosition`, `hull.hitTester.bbox`,
+  `hull.turretPositions[0]`, `turret.hitTester.bbox`,
+  `turret.gunPosition`) are **separate typeDescriptor sub-fields from
+  the ones that were `None`** (section 11) — these are not
+  server-gated, they should be readable client-side. Untested by this
+  project's own code yet — that's the next probe run.
+
+**Known gotcha (from decompiled `model_assembler.pyc`, not yet
+exercised by our own code)**: `hull.hitTester.bbox` /
+`turret.hitTester.bbox` are `None` in Garage until collisions are set
+up via `model_assembler.setupCollisions(vehicle.typeDescriptor,
+vehicle.appearance.collisions)`. In battle, the appearance already
+populates it (consistent with section 11's successful
+`topRightCarryingPoint` read in a Training Room). `# TODO(api-verify)`
+on the exact `setupCollisions` call — sourced from decompiled bytecode,
+not yet run by this project.
+
+**Existing prior art**: `wotstat/wotstat-debug-utils`'s
+`SpottingUtil.py` (`res/scripts/client/gui/mods/wotstatDebugUtils/coreUtils/spottingUtils/SpottingUtil.py`)
+already implements this exact reconstruction (via `getVehicleVisibilityBbox`
++ `getMaskSpotPoints`) for its own debug overlay, including the dynamic
+turret/gun matrix composition for the rotating port and the
+`turretAndGunAngles.getTurretYaw()/getGunPitch()` fallback when
+`appearance.turretMatrix`/`gunMatrix` are unavailable. Worth reading
+directly once Phase 2 implementation starts, as a second working
+reference alongside this formula — but per this project's `AGENTS.md`/
+`CONCEPT.md` convention, borrow the *pattern*, write our own
+implementation into `core/geometry.py` (pure math, matches this
+project's existing separation of pure-logic vs. game-API-glue code) and
+`core/transform.py` (the BigWorld glue), not a copy-paste.
+
+**Web search turned up nothing else**: no wiki, blog, or
+`docs.wotstat.info` page documents this exact geometry publicly —
+community "6 spotting points" writeups are conceptual only. The
+decompiled engine source and `wotstat-debug-utils` are the only two real
+sources.
+
+### Next: validate this formula live before it becomes real Phase 2 code
+
+`phase1_probe.py` was rewritten again to compute the 6 checkpoints + 2
+ports using this exact formula against a live vehicle, project them
+via the confirmed `node('hull')`/`node('turret')` world matrices, and
+log the result *repeatedly* (every 3s, up to 20 times) instead of once
+— so hull/turret rotation can be observed across log lines, closing the
+last unchecked box in TASKS.md Phase 1 ("rotate the turret, confirm the
+dynamic port's position changes; confirm the static checkpoints don't").
+The old XML-parsing and ghost-attribute diagnostics were removed from
+the probe — both questions are now conclusively answered, so they were
+just noise going into a repeating log.
+
+**Ask**: run this in Garage this time if possible (exercises the
+untested `setupCollisions` fallback), and try rotating the hull/turret
+during the ~60-second logging window. Once the numbers look sane and
+the turret-tracking port visibly moves while the hull checkpoints don't,
+Phase 1 is fully done and this logic moves into `core/geometry.py` +
+`core/transform.py` for real.
+
+---
+
+## 13. Session 3, live validation run — formula CONFIRMED CORRECT, Garage still broken
+
+Training Room, same vehicle, python.log captured across the full
+~60s/20-iteration window (`python.log` lines 644-917 in the client
+install).
+
+**Garage/hangar does NOT work** (matches the user's own report): the
+first iteration fired ~2s after "vehicle ready", while
+`hull.hitTester.bbox`/`turret.hitTester.bbox` were still `None`, and the
+`setupCollisions` fallback failed outright: `No module named
+model_assembler` — the import path guessed from decompiled bytecode is
+wrong (wrong module name or wrong package path; needs research, not
+guessing again). That said: **in this Training Room run, the bbox
+became available on its own 3 seconds later**, with no fallback needed
+— so battle contexts seem to self-populate collisions shortly after
+spawn, but Garage apparently does not (no battle-load pipeline to
+trigger it), so this import bug is a real blocker specifically for
+Garage, which is Phase 2's primary target per `CONCEPT.md` (Phase 2 is
+literally titled "Own-Tank Checkpoint/Port Visualization (**Garage**)").
+
+**Once bbox was available, every number came out sane and internally
+consistent** — several independent cross-checks all passed:
+- `front`/`rear` checkpoint z-offsets from hull center were nearly
+  equal and opposite (2.410 vs 2.406) — confirms the hull bbox is
+  symmetric and the formula's min/max usage is correct.
+- `right`/`left` checkpoint x-offsets were nearly equal and opposite
+  (-0.838 vs +0.844) — same symmetry check, x-axis.
+- `observerPosOnChassis` exactly equals `checkpoint[top]` on every
+  iteration — matches the formula (`Vector3(0, hullPos.y +
+  turretLocalTopY, 0)` computed twice) being literally the same value
+  both times, as intended.
+- `observerPosOnTurret`, computed purely from the formula
+  (`turretMatrix.applyPoint(gunPosition)`), landed within ~0.001 units
+  of `node('gun')`'s own directly-queried world position on every
+  iteration — two independently-derived numbers agreeing almost
+  exactly. Strong confirmation both the formula and the node-matrix
+  approach are correct.
+
+**Important subtlety, only discoverable by testing live rotation, not
+by reading the formula**: at iteration 9 (18:42:06), the vehicle's gun
+position changed (turret/gun rotated) while the hull position stayed
+fixed. Result:
+- `observerPosOnTurret` updated immediately to track the new gun
+  position (as expected — it's projected via the live `turret` node
+  matrix each call).
+- **`checkpoint[gunMount]` did NOT change** — it stayed at its
+  previous, pre-rotation value, even though "gunMount" sounds like it
+  should track the gun.
+
+This is correct, not a bug: `checkpoint[gunMount]` is computed as
+`hullPos + gunPosOnHull` where `gunPosOnHull = turretPosOnHull +
+gunPosition`, using the **static, neutral-pose** `gunPosition` from
+`typeDescriptor` (a per-vehicle design-time constant, not a live
+value), and the whole thing is projected through the **hull** matrix
+only. So **5 of the 6 visibility checkpoints — including the
+"gunMount" one — are rigidly hull-relative and never track live turret
+rotation.** Only `observerPosOnTurret` (the second view-range port)
+actually tracks turret rotation live, exactly as `TASKS.md` guessed
+("one port is static/hull-relative, the other tracks the gun mount,
+dynamic with turret rotation") — but the guess undersold it: it's not
+just one *port* that's static, it's the entire 6-checkpoint set. This
+matters for Phase 2/4: don't try to make checkpoint markers rotate with
+the turret, only the `observerPosOnTurret` marker should.
+
+Later iterations (10+) show the vehicle actually driving — hull,
+turret, and gun world positions all shift together by 10-25 units
+between 3s samples, and all 6 checkpoints + `observerPosOnChassis` move
+in lockstep with the hull, while `observerPosOnTurret` continued
+tracking gun/turret independently. This is the expected rigid-body
+behavior and closes out the "does it track a moving vehicle correctly"
+question too.
+
+### Phase 1 status: DONE for battle/Training Room contexts
+
+Every open item in section 7 is now answered with live, validated data.
+**Remaining before Phase 2 can start in Garage** (the actual primary
+target): fix the `model_assembler` import — needs a quick research
+pass, since guessing a second time already failed once.
+
+---
+
+## 14. Session 3 web research — Garage fix, CONFIRMED against this exact client version
+
+Found the decompiled-source branch that matches this project's actual
+client build exactly: `StranikS-Scan/WorldOfTanks-Decompiled`, branch
+`2.3.1_EU` (`version.xml` = `v.2.3.1.1 #910`) — also confirmed directly
+against this machine's own `res/packages/scripts.pkg`. Use this branch
+for any future decompiled-source lookups on this project; earlier
+sections referencing `1.16`/`1.42` were for other versions and can be
+stale.
+
+**Fix 1 — wrong import path (this is the whole bug).** The correct
+import is:
+
+```python
+from vehicle_systems import model_assembler
+```
+
+not top-level `model_assembler`. Source:
+`source/res/scripts/client/vehicle_systems/model_assembler.py`:
+
+```python
+def setupCollisions(vehicleDesc, collisions):
+    hitTestersByPart = {TankPartNames.CHASSIS: vehicleDesc.chassis.hitTester,
+     TankPartNames.HULL: vehicleDesc.hull.hitTester,
+     TankPartNames.TURRET: vehicleDesc.turret.hitTester,
+     TankPartNames.GUN: vehicleDesc.gun.hitTester}
+    for partName, hitTester in hitTestersByPart.iteritems():
+        partID = TankPartNames.getIdx(partName)
+        hitTester.bbox = collisions.getBoundingBox(partID)
+```
+
+**Why battle self-populates this and Garage doesn't**: in
+`client_common/vehicle_appearance/common_tank_appearance.py`,
+`CommonTankAppearance._connectCollider` ends by calling
+`model_assembler.setupCollisions(self.typeDescriptor, collisions)`.
+`client/gui/hangar_vehicle_appearance.py`'s
+`HangarVehicleAppearance._connectCollider` does **not** — it only calls
+`collisions.connect(...)`. That one missing call is the entire root
+cause of section 13's Garage failure — nothing else is different.
+
+**Fix 2 — vehicle detection is also wrong for Garage, separate bug.**
+`WotstatSpotting.py`'s `poll_for_probe` currently gates on
+`hasattr(player, 'getOwnVehicleStabilisedMatrix')`, which is battle/
+Avatar-only — in Garage, `BigWorld.player()` is a different class
+without this method, so the probe likely never fires at all in Garage,
+independent of the collision bug above. The confirmed Garage-side
+vehicle entity type is `HangarVehicle` (from
+`scripts/client/gui/...` — surfaced via `BigWorld.entities.values()`,
+same collection used for battle entities), not reachable through
+`player.playerVehicleID`.
+
+**Confirmed existing prior art**: `wotstat/wotstat-debug-utils`
+already solves both problems, in two files
+(`coreUtils/mainUtils/BboxUtil.py` and
+`coreUtils/spottingUtils/SpottingUtil.py`, both with an identical
+`updateHangarVehicle` block):
+
+```python
+hangarSpace = dependency.descriptor(IHangarSpace)
+...
+isInHangar = self.hangarSpace and self.hangarSpace.spaceID is not None
+if not isInHangar: return
+targetVehicles = [entity for entity in BigWorld.entities.values()
+                  if isinstance(entity, ClientSelectableCameraVehicle if self.showAny else HangarVehicle)
+                  and entity.appearance]
+for vehicle in targetVehicles:
+  if vehicle.typeDescriptor.hull.hitTester.bbox is None and vehicle.appearance.collisions is not None:
+    model_assembler.setupCollisions(vehicle.typeDescriptor, vehicle.appearance.collisions)
+```
+
+Also notes a *third* difference worth remembering for Phase 2/4 (not
+yet relevant to our node-matrix approach, which is separate from this):
+hangar appearance has no `turretMatrix`/`gunMatrix` attribute the way
+battle appearance does; that mod falls back to
+`vehicle.appearance.turretAndGunAngles.getTurretYaw()`. Our project
+uses `compoundModel.node('turret')` instead (Pattern A, section 10),
+which is a different, already-battle-confirmed mechanism — untested in
+Garage specifically, but no reason yet to think it's affected by this
+particular gap.
+
+### Applied to this project
+
+`phase1_probe.py` and `WotstatSpotting.py` updated this session:
+- `_ensureHullTurretBbox` now imports `from vehicle_systems import
+  model_assembler` (was bare `import model_assembler`), and only
+  attempts the call when `vehicle.appearance.collisions is not None`
+  (guards the same case `BboxUtil.py` guards).
+- Vehicle detection now tries the existing battle path first, then
+  falls back to scanning `BigWorld.entities.values()` for an entity
+  whose class name is `'HangarVehicle'` (duck-typed by name rather than
+  importing the class, to keep this throwaway probe minimal — `#
+  TODO(api-verify)`: revisit with a real import once this moves into
+  `core/transform.py`).
+
+**Ask**: rebuild and retest in Garage. If it works, Phase 1 is fully
+closed for both contexts and this logic (plus the confirmed formula
+from section 12) is ready to move into `core/geometry.py` +
+`core/transform.py` as real Phase 2 code.
+
+---
+
+## 15. Session 3, Garage retest — deprioritized, real cause identified
+
+The Garage retest log did **not** actually exercise the Fix 1/Fix 2
+code above. Timeline from the captured `python.log`:
+
+```
+18:54:00.188  last successful probe fire (still Training Room)
+18:54:01.302  Avatar.leaveArena (leaving the Training Room)
+18:54:27.979  HANGAR READY
+18:54:47.762  "Probe loop finished after 20 iterations"  <- no probe log between 18:54:01 and here
+```
+
+The repeating probe loop (`_repeatingProbe` in `WotstatSpotting.py`)
+locks onto a single `vehicleID` when it starts and never goes back to
+`poll_for_probe()` to look for a *new* vehicle if the game context
+changes mid-loop. Once the Training Room ended, `BigWorld.entity(oldID)`
+just returned nothing useful for the remaining iterations, and the loop
+silently ran out its fixed 20-iteration budget in Hangar without ever
+attempting a probe there. **This is a bug in this project's own polling
+architecture, not evidence that the Garage collision-setup fix (section
+14) doesn't work** — the fix was never actually tested.
+
+**Decision (explicit user instruction): stop pursuing Garage support
+for now, focus exclusively on battle/Replay/Training Room.** Applied to
+code this session:
+- `findOwnVehicle()` reverted to battle-only (`player.playerVehicleID`
+  path only); the `HangarVehicle` entity-scanning branch was removed.
+- `_ensureHullTurretBbox()` reverted to a plain getter — the
+  `model_assembler.setupCollisions` fallback (section 14) was removed
+  since it's unvalidated and no longer in scope.
+
+If Garage support is revisited later, section 14's findings (correct
+import path `from vehicle_systems import model_assembler`, the
+`HangarVehicle` entity type, the `IHangarSpace`/`BboxUtil.py`/
+`SpottingUtil.py` reference pattern) are still believed correct — they
+just were never actually exercised end-to-end due to the polling bug
+above, not disproven. The polling-restart bug itself would also need
+fixing (e.g. have `_repeatingProbe` fall back to `poll_for_probe()` when
+the tracked vehicle disappears) before a real Garage retest would be
+meaningful.
+
+### Phase 1 status: DONE (scope: battle/Replay/Training Room)
+
+All of section 7's original open items, plus the formula validation
+from sections 12-13, are answered and confirmed with live data. Ready
+to move this logic into `core/geometry.py` (pure math) +
+`core/transform.py` (BigWorld glue) for Phase 2, scoped to
+battle/Replay/Training Room only. Garage is explicitly out of scope
+until deliberately revisited.
+
+---
+
+## 16. Session 3 — Phase 2 data layer: geometry.py + transform.py written
+
+Migrated the confirmed logic out of the throwaway `phase1_probe.py`
+into real modules, matching the split `AGENTS.md` calls for ("keep
+local checks ... in files with no game-API imports so it's testable in
+isolation; keep game-API glue code separate"):
+
+- **`core/geometry.py`** (new): pure Python, zero game-API imports.
+  `computeLocalCheckpoints(...)` is the formula from section 12, taking
+  and returning plain `(x, y, z)`-indexable points instead of
+  `Math.Vector3` so it has no dependency on the game client at all.
+  Sanity-checked directly with `python3` (bbox symmetry ->
+  front/rear and left/right checkpoint pairs are mirror-symmetric;
+  `observerOnChassis == checkpoint['top']`; `gunMount` is the plain sum
+  of hull/turret/gun local offsets) — all passed. This is the "pure-
+  logic code... verified independently of the game client" `AGENTS.md`
+  asks for.
+- **`core/transform.py`** (new): the BigWorld glue. `findOwnVehicle()`
+  (moved from the probe, battle-only per section 15),
+  `getNodeMatrices()` (section 10's confirmed `compoundModel.node()` +
+  `Math.Matrix()` pattern), `getHullTurretBbox()` (section 13's
+  self-populating bbox, no Garage fallback), and
+  `computeWorldCheckpointsAndPorts(vehicle)` — the single entry point
+  Phase 2 rendering code should call, returning `(checkpoints, ports)`
+  dicts of world-space `Math.Vector3`, or `None` if collision data
+  isn't ready yet (not an error condition, just "retry next tick").
+- **`core/phase1_probe.py`** gutted down to a thin logging wrapper
+  around `transform.computeWorldCheckpointsAndPorts()`, per
+  `AGENTS.md`'s own instruction for this file ("delete or gut ... once
+  Phase 1 is marked fully confirmed"). `WotstatSpotting.py` needed no
+  changes — it already only calls `phase1_probe.findOwnVehicle()` /
+  `.runManualProbe()`, which now just delegate to the real modules.
+
+Verified: `python2 -m py_compile` on all four touched files, and a full
+`./build.sh -v <n> -d` packaging pass.
+
+**Re-verified against a live vehicle (Training Room) — migration
+confirmed correct, no behavior change from the pre-migration probe:**
+- `port['chassis']` exactly equals `checkpoint['top']` on every sample.
+- At one sample the turret rotated while the hull stayed still:
+  `port['turret']` moved, all 6 checkpoints stayed frozen — same
+  hull-vs-turret split confirmed in section 13.
+- Later samples show the vehicle driving: all 6 checkpoints + both
+  ports shift together, correct rigid-body behavior.
+- One harmless "not ready yet" line right after spawn (bbox not
+  populated for the first tick, as expected), then clean output with no
+  errors or crashes for the rest of the run.
+
+**Phase 2 data layer is done and confirmed working.** Next up is
+`core/overlay.py` (rendering), per the notes above.
+
+---
+
+## 17. Session 4 — rendering: DebugDrawer, not wg_draw_box (that claim was wrong)
+
+Before writing `core/overlay.py`, checked whether `wotstat-vegetation`
+(this project's own explicit pattern reference) actually uses
+`wg_draw_box`/`wg_draw_line` per the earlier "Post Phase 1 & 2" note in
+this file — **it does not**. Its real rendering uses two different
+things, neither a good fit here:
+- `gui.debugUtils` (`gizmos`/`drawer`) — optional import from the
+  *separate* `wotstat-debug-utils` mod, `None` if that mod isn't
+  installed. Can't be a primary dependency for this project's core
+  feature.
+- Actual spawned `BigWorld.Model` instances via `player.addModel()` +
+  `BigWorld.Servo(matrix)` for its always-on colliders — real, working,
+  but needs real `.model`/`.visual` assets and a whole caching pipeline
+  (`VegetationColliderCache`), overkill for simple point markers.
+
+Given `wg_draw_box`/`wg_draw_line` had never been independently
+verified (that note came from an earlier session's own unverified
+claims, which the user asked to disregard), did a fresh research pass
+against the decompiled `2.3.1_EU` source and this machine's actual
+retail binary rather than trust it again.
+
+**Found: `DebugDrawer`, a native (compiled-in, no `.py` source) Python
+module.** Confirmed two ways:
+- WG's own shipped script calls it —
+  `vehicle_systems/components/vehicle_to_camera_alignment_components.py`:
+  ```python
+  import DebugDrawer
+  DebugDrawer.DebugDrawer().cube().zTest(False).wireframe(True).colour(4278255360L).position(aabbCenter).scale(vehicleSize)
+  DebugDrawer.DebugDrawer().sphere().zTest(False).wireframe(True).colour(4294967040L).position(frameCenter).scale(Math.Vector3(0.2, 0.2, 0.2))
+  DebugDrawer.DebugDrawer().line().zTest(False).colour(4294967040L).points([aabbCenter, frameCenter])
+  ```
+- The full registered API is visible via C++ RTTI symbols in this
+  machine's actual retail `WorldOfTanks.exe`: factories
+  `line, bullet, cube, rgbCube, sphere, cone, cylinder, sector, label,
+  rect2D, star, axes, frustum`; builder methods `wireframe, zTest,
+  zWrite, blendMode, doubleSided, colour, position, rotation, scale,
+  transform, aabb`. Fluent, returns self, no `lifetime`/persistence
+  method — matches the immediate-mode, called-every-tick usage in WG's
+  own example.
+
+**Refuted the earlier "helpers/models/unit_cube.model often
+missing/broken in retail" claim directly**: scanned all 115 `.pkg`
+files in this install's `res/packages/` for `helpers/models` — zero
+hits (method validated by successfully finding an unrelated known-good
+path in the same scan). That code path is simply dead in retail, not
+"sometimes broken." Two *different* primitive models genuinely do ship,
+in `misc.pkg`, as a fallback if `DebugDrawer` doesn't pan out:
+`system/models/fx_unit_sphere.model` and
+`objects/misc/bbox/unit_cube_1m_proxy.model`.
+
+**Also checked `wotstat-debug-utils`'s own gizmo internals** (not to
+depend on the mod, but to see its technique): it does not use 3D
+geometry at all. Its `Box`/markers are 2D — 8 world points pushed to a
+Cohtml overlay via `GUI.WGMarkerPositionController`, rendered by
+TypeScript in screen space. Worth remembering as a fallback pattern if
+`DebugDrawer` turns out not to render in a retail build, but not
+preferred (loses true 3D depth/occlusion behavior).
+
+**Honest open item, not yet resolved**: `DebugDrawer`'s only found
+caller in the decompile sits behind a `g_alignmentCameraVisuals.enabled`
+flag inside a `CGF.Domain.ClientEditor`-namespaced file, and BigWorld
+engines sometimes stub debug-draw calls outside dev/editor builds. It
+is **not yet confirmed to actually render anything in this retail
+client** — that's what the first live test of `core/overlay.py` is for.
+If nothing appears, fall back to `BigWorld.Model('objects/misc/bbox/unit_cube_1m_proxy.model')`
+(confirmed shipped) before trying the 2D-projection route.
+
+### Applied: core/overlay.py + real toggle wiring
+
+- **`core/overlay.py`** (new): `render(checkpoints, ports)` draws a
+  small wireframe cube per point via `DebugDrawer`, distinct colors for
+  checkpoints vs. ports. Immediate-mode — must be called every frame
+  while active, matching WG's own usage pattern. Color channel order
+  (`colour()` takes a packed int) is unconfirmed — marked
+  `# TODO(api-verify)`, adjust once actual rendered colors are visible.
+- **`WotstatSpotting.py`** rewritten: dropped the auto-starting Phase 1
+  probe loop entirely (that was throwaway verification code, now
+  superseded); added a real `F4` toggle (F2/F3 are already used by
+  `wotstat-vegetation`, per `CONCEPT.md`'s own note to pick unused keys)
+  wired through `InputHandler.g_instance.onKeyUp`, following
+  `wotstat-vegetation`'s own confirmed-working pattern for this exact
+  mechanism (`WotstatVegetation.py`'s `handleKeyUpEvent`) rather than
+  guessing at the input API. While toggled on, a `BigWorld.callback(0,
+  ...)`-driven loop calls `transform.computeWorldCheckpointsAndPorts()`
+  + `overlay.render()` every frame.
+- `core/phase1_probe.py` is now unused (nothing calls it) but left in
+  place rather than deleted, in case its log-based verification is
+  useful again later.
+- **No restriction gate yet** (`utils/restriction.py` is still Phase
+  3/empty) — the overlay currently runs in any context with a vehicle,
+  same situation the Phase 1 probe was already in. Only test in
+  Garage/Replay/Training Room until Phase 3 adds the gate.
+
+Verified: `python2 -m py_compile` on both changed files, full
+`./build.sh -d` packaging pass.
+
+**CONFIRMED LIVE — `DebugDrawer` renders in this retail client.** User
+tested in a Training Room (EBR 105, F4 toggle): green checkpoint cubes
+and red port cubes both rendered, visible on-screen, positioned
+plausibly around the hull/turret. The honest gap from earlier in this
+section (only known caller was behind a disabled-by-default editor
+flag) is now closed — it works in retail via direct Python calls same
+as any other BigWorld module. No need for the `unit_cube_1m_proxy.model`
+fallback.
+
+One expected visual detail, not a bug: since `port['chassis']` is
+defined as exactly equal to `checkpoint['top']` (confirmed formula,
+section 12), their markers render at the *same world position* --
+whichever color draws last wins/overlaps at that one spot. This is
+correct per the engine's own definition of that port, not a rendering
+mistake.
+
+**Phase 2 core rendering is done and confirmed working end-to-end**:
+data layer (`geometry.py`/`transform.py`) + rendering (`overlay.py`) +
+toggle (`WotstatSpotting.py`, F4) all verified live.
+
+---
+
+## 18. Session 4 — visual test on EBR 105: markers near tank but "a bit too high"
+
+First screenshot test (previous section) was on an **EBR 105** (French
+8-wheeled light tank) — note this was also the *first ever visual test*
+of this formula; all prior validation (sections 12-13, 16) was
+numeric/log-only, on a different vehicle (`china:Ch29_Type_62C_prot`).
+There is no prior "known good" visual baseline to compare against.
+
+User's initial read (markers on distant buildings) turned out to be a
+zoomed/aiming-mode camera perspective illusion, not a bug — on
+re-check with a normal view, markers are confirmed near the tank, but
+consistently sit **a bit higher than the actual hull/turret surface**.
+
+Two live possibilities, not yet distinguished:
+1. **Genuine per-vehicle bbox looseness**: the checkpoints come from
+   `hull.hitTester.bbox`/`turret.hitTester.bbox` -- a *collision*
+   envelope, not the visual mesh. The EBR 105 is unusually low/flat
+   with large wheels that may be included in the hull's collision
+   bbox, which could inflate `hullBboxMax.y` (and therefore the 'top'
+   checkpoint, which is `max(hullBboxMax.y, turretPosOnHull.y +
+   turretBboxMax.y)`) well above the visual roofline. If so, this is
+   correct-per-the-engine's-own-definition, not a bug -- same category
+   as the chassis/top overlap noted in section 17.
+2. **A real coordinate bug**: e.g. some Y-offset being double-counted
+   between `node('hull')`'s own translation and
+   `chassis.hullPosition.y` being added on top of it. Not yet ruled
+   out -- the formula was only ever numerically validated on one
+   vehicle, and that validation checked internal consistency
+   (symmetry, chassis==top, turret-port-matches-node-gun) rather than
+   "does the absolute height match the visible model."
+
+**Added temporary diagnostic logging to settle this** (remove once
+resolved): `core/transform.py`'s new `getDebugSnapshot(vehicle)`
+returns every raw input to the formula (both node positions,
+`chassis.hullPosition`, both bboxes, `gunPosition`) rather than just
+final results. `WotstatSpotting.py`'s `_overlayUpdate()` now logs a
+full snapshot (raw inputs + final world checkpoints/ports) every ~90
+frames, gated on `DEBUG_MODE` (already on in the user's build).
+
+**Ask**: retest with F4, grab the `python.log`, and if possible a
+screenshot from directly beside the tank (not zoomed/aiming) for the
+clearest visual read. With the raw `hullBboxMax.y` /
+`turretPosOnHull.y` / `turretBboxMax.y` values in hand, this should be
+answerable directly rather than by further guessing.
+
+---
+
+## 19. Session 4 — found and fixed: a real coordinate-space bug, not a bbox/antenna quirk
+
+User's own hypothesis ("some tanks have antennas that could influence
+the box") was reasonable to check but turned out not to be the cause --
+the real bug was cleaner and fully explains the observed height with
+exact numbers, from the debug snapshot (EBR 105):
+
+```
+nodeHullPos         = (-369.430, 16.900, 35.493)
+nodeTurretPos       = (-369.431, 17.126, 35.487)
+chassisHullPosition = (0.000,   1.202,  0.000)
+hullBboxMax         = (0.841,   0.262,  2.409)
+turretPosOnHull     = (0.000,   0.226, -0.007)
+turretBboxMax       = (0.955,   0.794,  0.987)
+checkpoint[top]     = (-369.381, 19.120, 35.385)   <- what rendered
+```
+
+`turretLocalTopY = max(hullBboxMax.y, turretPosOnHull.y + turretBboxMax.y)
+= max(0.262, 1.020) = 1.020`. The old formula then added
+`chassisHullPosition.y` (1.202) on top of that *before* projecting
+through `node('hull')`'s matrix:
+`16.900 + 1.202 + 1.020 = 19.122` -- matches the logged `19.120`
+(rounding) essentially exactly.
+
+**Root cause**: `node('hull')` (the compound-model node this project
+uses for the hull's world matrix -- section 10) is already the hull's
+*fully-resolved* world position, with `chassis.hullPosition` baked in
+by the model rig. Adding it again as a local offset before applying
+that same matrix double-counts it. This is a variant of the
+"Double Transformation" trap already flagged early in this file (there
+about `vehicle.matrix`) -- same mistake, different mechanism (additive
+offset + already-elevated matrix, instead of matrix*matrix).
+
+The engine's own formula (section 12, `VehicleDescriptor.__initAttrs__`)
+*does* add `chassis.hullPosition` -- because it computes points meant
+for the vehicle ENTITY's root/ground matrix, a different matrix than
+`node('hull')`. This project never used that entity-root matrix (Pattern
+A / `node()` was the confirmed, validated approach from section 10), so
+porting the offset along with the rest of the formula was the bug.
+
+**Verified the fix directly against the logged numbers**
+(`python3`, no game client needed -- this is exactly the "pure logic,
+testable independently" split `AGENTS.md` asks for):
+```
+checkpoint['top'] local = (0.0, 1.02, 0.0)
+-> world y = nodeHullPos.y (16.900) + 1.02 = 17.920
+-> matches turretPosOnHull.y + turretBboxMax.y + nodeHullPos.y = 17.920 independently
+```
+17.920 is the turret's own roof height, measured completely
+independently (via `node('turret')` + `turretBboxMax.y`) from the
+checkpoint formula -- two different derivations landing on the same
+number is strong confirmation, not a coincidence. Also reverified
+`chassis port == top checkpoint` and `front`/`rear` sharing the same Y
+(hull mid-height symmetry) still hold after the fix.
+
+**Applied**: `core/geometry.py`'s `computeLocalCheckpoints()` no longer
+takes or adds a `hullPos` parameter at all -- points are now purely
+hull-local, matching what `node('hull')` actually expects.
+`core/transform.py`'s call site updated to match (still reads
+`chassis.hullPosition` for the debug snapshot, just doesn't feed it
+into the formula anymore).
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass.
+
+**CONFIRMED LIVE**: retested on the same EBR 105, non-zoomed side view.
+Markers now sit directly on the model -- red on the turret roof, red on
+the gun mantlet, green along the hull/wheels. No more floating above
+the tank. User's read: "looks pretty reasonable."
+
+**Phase 2 is now fully done and confirmed correct end-to-end**: data
+layer, rendering, toggle, and this coordinate-space fix all verified
+live. No known open bugs in the core checkpoint/port visualization.
+
+---
+
+## 20. Session 4 — polish pass: cleanup + labels + resilience
+
+- Removed the temporary per-frame debug snapshot logging from
+  `WotstatSpotting.py` (`_logDebugSnapshot`, the frame counter, the
+  `DEBUG_MODE`-gated dump) now that section 19's bug is fixed and
+  confirmed live -- it had served its purpose.
+  `transform.getDebugSnapshot()` itself is left in place, unused but
+  available, same precedent as keeping `core/phase1_probe.py` around
+  after Phase 1 closed.
+- `core/overlay.py`: added distinct colors per *named* port (`chassis`
+  = red, `turret` = magenta) on top of the existing checkpoint/port
+  color split, and added text labels via `DebugDrawer`'s `label()`
+  builder (`.text(name).colour(...).position(...)`). **This is a new,
+  not-yet-live-confirmed use of `DebugDrawer`** (only `cube()` has
+  actually been confirmed rendering so far, section 17) -- so
+  `_drawLabel()` wraps the call in try/except with a sticky
+  `_labelsSupported` flag: if `label()` doesn't work the way this code
+  assumes, it logs once and silently stops trying on every subsequent
+  frame, rather than either crashing repeatedly or spamming the log.
+  Marker boxes render either way, independent of whether labels work.
+- `WotstatSpotting.py`'s `_overlayUpdate()` now wraps the vehicle
+  lookup + compute + render sequence in try/except -- previously an
+  unhandled exception anywhere in that chain (e.g. from the new,
+  unconfirmed `label()` call) would have silently killed the
+  `BigWorld.callback(0, ...)` reschedule and stopped the overlay
+  updating until the next F4 toggle. Now a bad frame just logs and
+  continues.
+
+Verified: `python2 -m py_compile` + full `./build.sh -d` packaging
+pass.
+
+**CONFIRMED LIVE**: `label()` renders text correctly (readable "front",
+"rear", "left", "port:turret" labels visible next to markers on an
+EBR 105). This is a new confirmed API alongside `cube()`.
+
+**User feedback**: labels didn't add much value once marker positions
+were already confirmed correct, and cluttered the view -- asked for a
+separate toggle rather than always-on with the overlay. Applied:
+`overlay.render()` now takes a `showLabels` parameter (default
+`False`), and `WotstatSpotting.py` binds a second key, **F5**, to
+`g_labelsEnabled`, independent of the main **F4** overlay toggle. Text
+labels off by default; marker boxes unaffected either way.
+
+**User feedback**: switch marker shape from wireframe cubes to filled
+spheres for easier at-a-glance discernment. Applied: `_drawMarker()`
+now calls `.sphere().wireframe(False)` instead of
+`.cube().wireframe(True)`. `sphere()` is a confirmed `DebugDrawer`
+factory (section 17's binary/decompile research) but this is its first
+actual live test -- if it doesn't render, `cube()` is the known-working
+fallback shape to revert to.
+
+### Next: Phase 2 rendering (`core/overlay.py`)
+
+`transform.computeWorldCheckpointsAndPorts()` is the data source Phase
+2's rendering step needs. Per this project's earlier (failed,
+per-the-user Session 2/3 note) overlay attempt, the two concrete
+findings already on record to apply this time: use `BigWorld.wg_draw_box`
+/ `BigWorld.wg_draw_line` (Z-buffer-independent debug primitives,
+confirmed to need no external model assets — see the "Rendering & API
+Stability" note further up this file) rather than spawning model
+instances, and watch out for the double-init/double-toggle bug (already
+guarded against in `WotstatSpotting.py` via `g_probeStarted`, but a
+fresh toggle-state global will need the same guard).
+
 
 This is a comprehensive summary of the technical hurdles and breakthroughs we encountered during Phase 1 and Phase 2. You should append this to your `NOTES.md` to ensure future development (or AI agents) doesn't fall into the same "research loops."
 
