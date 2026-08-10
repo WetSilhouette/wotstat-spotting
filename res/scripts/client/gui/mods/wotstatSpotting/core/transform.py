@@ -11,6 +11,7 @@ import BigWorld
 import Math
 
 from . import geometry
+from . import exposure
 from ..utils.logger import log
 
 _NODE_NAMES = ('hull', 'turret')
@@ -54,12 +55,16 @@ def getHullTurretBbox(descr):
 
 def computeWorldCheckpointsAndPorts(vehicle):
   """
-  Returns (checkpoints, ports) on success, or None if the vehicle's
-  collision/model data isn't ready yet (normal for the first couple
-  seconds after spawn -- callers should retry, not treat this as an
-  error). checkpoints is a dict of geometry.CHECKPOINT_NAMES -> world
+  Returns (checkpoints, ports, exposures) on success, or None if the
+  vehicle's collision/model data isn't ready yet (normal for the first
+  couple seconds after spawn -- callers should retry, not treat this as
+  an error). checkpoints is a dict of geometry.CHECKPOINT_NAMES -> world
   Math.Vector3; ports is a dict of geometry.PORT_NAMES -> world
-  Math.Vector3.
+  Math.Vector3; exposures is a dict of geometry.CHECKPOINT_NAMES ->
+  one of exposure.EXPOSURE_BUCKETS, classified from the same local
+  offsets before the world-space projection (see
+  exposure.classifyExposure -- purely self-referential, never uses
+  enemy data).
   """
   try:
     descr = vehicle.typeDescriptor
@@ -88,13 +93,14 @@ def computeWorldCheckpointsAndPorts(vehicle):
     worldCheckpoints = {}
     for name in geometry.CHECKPOINT_NAMES:
       worldCheckpoints[name] = hullMatrix.applyPoint(Math.Vector3(*localCheckpoints[name]))
+    exposures = exposure.classifyAllExposures(localCheckpoints)
 
     worldPorts = {
       'chassis': hullMatrix.applyPoint(Math.Vector3(*observerOnChassis)),
       'turret': turretMatrix.applyPoint(gunPosition),
     }
 
-    return worldCheckpoints, worldPorts
+    return worldCheckpoints, worldPorts, exposures
   except Exception as e:
     log('computeWorldCheckpointsAndPorts error: ' + str(e))
     return None

@@ -44,8 +44,8 @@ def _overlayUpdate():
     if vehicle:
       result = transform.computeWorldCheckpointsAndPorts(vehicle)
       if result:
-        checkpoints, ports = result
-        overlay.render(checkpoints, ports, showLabels=g_labelsEnabled)
+        checkpoints, ports, exposures = result
+        overlay.render(checkpoints, ports, exposures=exposures, showLabels=g_labelsEnabled)
   except Exception as e:
     # A rendering hiccup on one frame shouldn't kill the whole loop --
     # still reschedule below either way.

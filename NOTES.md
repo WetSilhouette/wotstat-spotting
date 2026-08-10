@@ -1762,3 +1762,74 @@ no game-mode gating, only test in Garage/Replay/Training Room. Phase 4
 (derived stats) built, partially fixed across multiple rounds, then
 removed by explicit user decision after hitting real, well-documented
 technical limits. Phase 5/6 (polish, release) not started.
+
+---
+
+## 23. Session 5 — angle-based exposure hints (the one Phase 4 idea that survived)
+
+After the camo/view-range removal, recommended this as the one
+remaining Phase 4-era idea worth building: unlike camo, it needs zero
+new game-API lookups -- it's pure vector math on data
+`core/transform.py` already computes and has had confirmed live for
+sessions. `CONCEPT.md` section 3 explicitly scoped this as legitimate
+from the start: "visualize checkpoint exposure relative to hull/turret
+facing and camera direction, **not** relative to any actual enemy
+position."
+
+**Design**: classify each of the 6 checkpoints by the angle between
+its own hull-local (x, z) offset and hull-forward (the fixed local
+`(0, 0, 1)` axis in the same frame `core/geometry.py`'s
+`computeLocalCheckpoints` already uses -- confirmed by the fact
+`front`/`rear` checkpoints are literally defined by `hullBboxMax.z`/
+`hullBboxMin.z`). Bucketed via `cos(45deg)` thresholds into
+`'facing'`/`'side'`/`'rear'`. Y (height) is ignored -- this is about
+horizontal facing, not vertical position. A checkpoint sitting exactly
+on the centerline (`'top'`, local x=z=0) has no defined direction and
+defaults to `'facing'`.
+
+Sanity-tested independently with `python3` (no game client) against
+both `computeLocalCheckpoints`' actual output and synthetic 30/60-degree
+offsets -- `front`/`gunMount`/`top` all classify `'facing'`,
+`'rear'` classifies `'rear'`, `'left'`/`'right'` classify `'side'`,
+30deg-from-forward is `'facing'`, 60deg is `'side'`. All passed.
+
+**Architecture note**: initially implemented in `core/geometry.py`
+directly, then moved to a new `core/exposure.py` -- `CONCEPT.md`
+section 5's original architecture sketch scaffolded a *dedicated*
+`core/exposure.py` module for exactly this ("angle-based exposure
+heuristics"), separate from `geometry.py`'s checkpoint/port offset
+math, and that file had sat empty since Phase 0. Moved
+`classifyExposure`/`EXPOSURE_BUCKETS` there and added
+`classifyAllExposures(localCheckpoints)` as the dict-batch entry point
+`core/transform.py` calls, keeping the same
+zero-game-API-imports/independently-testable split as `geometry.py`.
+
+**Wired through the existing pipeline, no new visualization layer**
+(matches `TASKS.md`'s own plan: "tint 'facing' checkpoints
+differently... rather than adding a whole separate visualization"):
+- `transform.computeWorldCheckpointsAndPorts()` now returns a 3-tuple,
+  `(checkpoints, ports, exposures)` -- a breaking change to its return
+  arity, updated at its one call site in `WotstatSpotting.py`.
+- `overlay.render()` gained an `exposures=None` parameter; when given,
+  it tints each checkpoint marker by bucket instead of the old flat
+  green. Colors picked to avoid clashing with the existing port colors
+  (red=chassis, magenta=turret): `facing`=orange, `side`=yellow,
+  `rear`=green (same as the old flat default, so a stationary
+  head-on view looks unchanged from before this feature).
+- No new keybind -- exposure coloring is always on whenever the F4
+  overlay is on; F5 labels still work identically (checkpoint names),
+  independent of the new colors.
+
+**Cleanup while touching this code**: deleted `core/phase1_probe.py`
+(verification wrapper for the Phase1->Phase2 migration, unused since
+that migration was long since confirmed -- `AGENTS.md` itself says to
+delete it once Phase 1 is fully confirmed, and it would have broken
+outright on the new 3-tuple return anyway since nothing was maintaining
+it).
+
+Verified: `python2 -m py_compile` on all five touched/added files,
+`grep` confirms no leftover references to the deleted file, and a full
+`./build.sh -d` packaging pass. **Not yet verified live** -- next test
+is F4 in Training Room, rotating the hull, and checking that
+front-ish checkpoints go orange, side checkpoints yellow, and
+rear-ish checkpoints stay green as the tank turns.

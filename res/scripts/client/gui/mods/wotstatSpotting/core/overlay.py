@@ -24,7 +24,18 @@ import Math
 
 from ..utils.logger import log
 
-_CHECKPOINT_COLOR = 0xFF00FF00  # green -- confirmed rendering correctly
+_CHECKPOINT_COLOR = 0xFF00FF00  # green -- confirmed rendering correctly, fallback if exposure unavailable
+# Angle-based exposure hints (core/geometry.py:classifyExposure) --
+# purely self-referential to the vehicle's own hull orientation, never
+# enemy data (CONCEPT.md section 3). Colors chosen to avoid clashing
+# with the port colors below (no red, no magenta): green/yellow/orange
+# reads as a "how toward-your-own-facing-direction is this point"
+# gradient, not a safety claim.
+_EXPOSURE_COLORS = {
+  'facing': 0xFFFF8800,  # orange
+  'side': 0xFFFFFF00,  # yellow
+  'rear': 0xFF00FF00,  # green -- same as the old flat checkpoint color
+}
 _PORT_COLORS = {
   'chassis': 0xFFFF3030,  # red -- static, hull-relative (== checkpoint['top'])
   'turret': 0xFFFF00FF,  # magenta -- the one point that tracks turret rotation live
@@ -62,7 +73,7 @@ def _drawLabel(worldPos, text, color):
     log('DebugDrawer label() not supported, disabling text labels: ' + str(e))
 
 
-def render(checkpoints, ports, showLabels=False):
+def render(checkpoints, ports, exposures=None, showLabels=False):
   """
   Draws one frame's worth of markers from
   core.transform.computeWorldCheckpointsAndPorts()'s output. Must be
@@ -71,11 +82,20 @@ def render(checkpoints, ports, showLabels=False):
   separate toggle from the overlay itself (see WotstatSpotting.py) --
   text labels didn't add much once the marker positions were already
   confirmed correct, so they default off.
+
+  exposures, if given, is a dict of checkpoint name -> one of
+  geometry.EXPOSURE_BUCKETS ('facing'/'side'/'rear'), used to tint each
+  checkpoint marker instead of the flat default color -- see
+  core/geometry.py:classifyExposure. None (the default) falls back to
+  the flat green for every checkpoint, e.g. if the caller doesn't have
+  exposure data for some reason.
   """
   for name, worldPos in checkpoints.items():
-    _drawMarker(worldPos, _CHECKPOINT_SIZE, _CHECKPOINT_COLOR)
+    bucket = exposures.get(name) if exposures else None
+    color = _EXPOSURE_COLORS.get(bucket, _CHECKPOINT_COLOR)
+    _drawMarker(worldPos, _CHECKPOINT_SIZE, color)
     if showLabels:
-      _drawLabel(worldPos, name, _CHECKPOINT_COLOR)
+      _drawLabel(worldPos, name, color)
   for name, worldPos in ports.items():
     color = _PORT_COLORS.get(name, _CHECKPOINT_COLOR)
     _drawMarker(worldPos, _PORT_SIZE, color)
