@@ -1696,3 +1696,69 @@ pass. **Not yet verified live** for the reverted formula + new label
 text (though the formula itself was already confirmed working at 44%
 before the `getClientInvisibility` detour, so this is mostly a
 text/framing change plus removing the broken call).
+
+---
+
+## 22. Session 5 — vegetation-merge feasibility check, then Phase 4 removed entirely
+
+User asked whether `wotstat-vegetation` could be merged in to compute
+the actual bush-bonus camo value (rather than just labeling the gap).
+Researched properly rather than assuming it was the same dead end as
+the earlier bush finding:
+
+- The vegetation density data itself is real, shipped game data (398
+  vegetation objects in this client's `destructibles.xml`, densities
+  of exactly `0.25`/`0.5`, matching `wotstat-vegetation`'s own
+  classification) — not a heuristic table. `wotstat-vegetation`
+  already solves reading it.
+- But the mechanic is **structurally per-enemy**: it's a ray/
+  line-of-sight test computed independently for each enemy's viewpoint
+  against your checkpoints, not a property of your own tank alone. The
+  server attribute (`foliageInvisibilityFactor`) is flagged
+  `CELL_PRIVATE` in the game's own entity definition — never sent to
+  any client, ever. The combining formula also isn't in the shared
+  client+server code, only server-side.
+- Conclusion: an accurate bush bonus **cannot** be computed from own
+  data alone — it inherently requires the enemy's position, which is
+  exactly the category this project's non-goals already rule out (no
+  enemy-relative prediction, no data about specific opponents). Not
+  pursued, for the same reason the project's hard scope wall exists,
+  not just a technical limitation.
+- Noted a legitimately in-scope alternative if ever wanted later: a
+  directional "dense/sparse foliage cover toward direction X" hint
+  using only own-checkpoint raycasts against local vegetation data —
+  a positioning aid, not a camo percentage, no enemy data needed. Not
+  built; just recorded as a real option for the future.
+
+**Decision: remove Phase 4 (view range + camo) entirely, keep only
+Phase 2 (checkpoints/ports).** After four research rounds on camo
+alone hit a genuine, well-confirmed dead end (device-bonus gap
+unexplained even at the source level; bush bonus structurally
+unobtainable without crossing the project's own non-goals), the user
+chose to drop the feature rather than ship a permanently-caveated
+"45%+ (min)" number.
+
+Removed: `core/stats.py` (deleted entirely, not just gutted —
+`getEffectiveViewRange()`, `getCamouflagePercentStationary()`,
+`getCamouflageDebugSnapshot()`, all their now-confirmed and
+now-abandoned API paths). `core/overlay.py`'s `renderStats()` and its
+label constants removed. `WotstatSpotting.py`: removed the `stats`
+import, the stats cache/frame-counter globals, `_refreshStatsCache()`,
+`_logStatsSnapshot()`, the F6 keybind entirely, and the
+`overlay.renderStats(...)` call from the per-frame loop. F4 (overlay
+toggle) and F5 (label toggle) are unchanged.
+
+Verified: `python2 -m py_compile` on both changed files, `grep` confirms
+zero remaining references to `stats`/`core.stats` anywhere in `res/`,
+and a full `./build.sh -d` packaging pass — package size dropped from
+~24KB to ~14KB, consistent with a clean removal rather than dead code
+left behind.
+
+**Current scope, for anyone picking this project up**: Phase 0-2 done
+and confirmed live (scaffolding, research, own-vehicle
+checkpoint/port visualization with F4 toggle + F5 optional labels).
+Phase 3 (restriction gate) skipped by explicit user decision — still
+no game-mode gating, only test in Garage/Replay/Training Room. Phase 4
+(derived stats) built, partially fixed across multiple rounds, then
+removed by explicit user decision after hitting real, well-documented
+technical limits. Phase 5/6 (polish, release) not started.
