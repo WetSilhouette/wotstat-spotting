@@ -1833,3 +1833,60 @@ Verified: `python2 -m py_compile` on all five touched/added files,
 is F4 in Training Room, rotating the hull, and checking that
 front-ish checkpoints go orange, side checkpoints yellow, and
 rear-ish checkpoints stay green as the tank turns.
+
+---
+
+## 24. Session 5 — per-step diagnostic logging, so a future WoT patch is traceable
+
+User asked: since this project has accumulated a long list of
+`# TODO(api-verify)` assumptions across `core/transform.py` and
+`core/overlay.py` (compoundModel node names, `hitTester.bbox` shape,
+`Matrix.applyPoint`, `DebugDrawer` builder methods...), how would a
+future WoT patch that breaks one of them actually show up in the log,
+in a way that's traceable back to the specific broken assumption
+rather than one vague bundled exception?
+
+**Before this session**: `computeWorldCheckpointsAndPorts()` had ONE
+try/except around its entire body -- any failure inside collapsed into
+a single generic `"computeWorldCheckpointsAndPorts error: <exception>"`
+message with no indication of which of its ~6 internal steps broke.
+`overlay.py`'s `_drawMarker()` (the sphere-drawing call, i.e. the core
+visible feature) had **zero** error handling at all -- a break there
+would propagate up to `WotstatSpotting.py`'s outer catch and log an
+even more generic `"overlay update error: ..."`, and would do so
+**every single frame** (60x/second) for as long as the overlay stayed
+on, since nothing there was sticky/one-time.
+
+**Applied**: broke `computeWorldCheckpointsAndPorts()` into 6
+individually-wrapped steps (`typeDescriptor` read, `hitTester.bbox`
+read, node-matrix lookup, typeDescriptor sub-field reads, the pure-math
+`geometry.computeLocalCheckpoints` call, and the final
+`Matrix.applyPoint` projection), each logging a specific `"BROKEN: ..."`
+message naming the exact API call(s) involved and pointing at the
+relevant `NOTES.md` section for context -- but only **once per
+session** (a `_diagnosticsLogged` dict + `_logOnce()` helper), so a
+persistent break logs one clear line instead of spamming. Same
+treatment for `findOwnVehicle()`. `overlay.py`'s `_drawMarker()` got
+the same sticky-once try/except `_drawLabel()` already had (that
+existing pattern was the template for all of this). `WotstatSpotting.py`'s
+outer catch-all is now also sticky, explicitly labeled as a
+last-resort ("not caught more specifically in transform.py/overlay.py")
+so its presence in a log signals something genuinely new/unanticipated
+rather than one of the already-named failure modes.
+
+Net effect: if a future WoT patch breaks, say, `compoundModel.node()`,
+the log will show exactly one line: `"BROKEN:
+vehicle.appearance.compoundModel.node()/Math.Matrix() (NOTES.md
+section 10) -- <real exception text>"`, immediately after toggling F4,
+and nothing else repeating every frame. That's directly actionable —
+compare against `NOTES.md` section 10's confirmed API history to see
+what changed, without needing to bisect which of the ~15 assumptions
+in this project broke by trial and error.
+
+Verified: `python2 -m py_compile` on all three touched files, full
+`./build.sh -d` packaging pass. This doesn't change any working
+behavior (every currently-confirmed API path is unaffected) -- it's
+purely additive diagnostic infrastructure, so no live retest is
+strictly required, though the next normal F4 test will exercise it
+implicitly (no `BROKEN:` lines should appear if everything's still
+working as of `2.3.1_EU`).

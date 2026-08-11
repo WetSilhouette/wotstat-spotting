@@ -43,19 +43,33 @@ _PORT_COLORS = {
 _CHECKPOINT_SIZE = 0.15  # meters, cube edge length
 _PORT_SIZE = 0.22
 
-# Sticky flag: if label() turns out not to exist/behave as expected,
-# stop trying after the first failure instead of throwing every frame.
+# Sticky flags: if a DebugDrawer builder call stops working (e.g. after
+# a WoT patch changes/removes an API this project depends on), log ONE
+# clear, specific message identifying exactly what broke, then stop
+# retrying every frame instead of either crashing repeatedly or
+# spamming the log. This is what makes "which of my ~15 TODO(api-verify)
+# assumptions did this patch break" answerable from a log file instead
+# of a guessing game -- see NOTES.md for the running list of what's
+# been confirmed live vs. still assumed.
+_markersSupported = True
 _labelsSupported = True
 
 
 def _drawMarker(worldPos, size, color):
-  (DebugDrawer.DebugDrawer()
-    .sphere()
-    .zTest(False)
-    .wireframe(False)
-    .colour(color)
-    .position(worldPos)
-    .scale(Math.Vector3(size, size, size)))
+  global _markersSupported
+  if not _markersSupported:
+    return
+  try:
+    (DebugDrawer.DebugDrawer()
+      .sphere()
+      .zTest(False)
+      .wireframe(False)
+      .colour(color)
+      .position(worldPos)
+      .scale(Math.Vector3(size, size, size)))
+  except Exception as e:
+    _markersSupported = False
+    log('DebugDrawer sphere() marker rendering broke -- disabling markers for this session: ' + str(e))
 
 
 def _drawLabel(worldPos, text, color):

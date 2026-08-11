@@ -23,6 +23,12 @@ if 'g_overlayEnabled' not in globals():
 if 'g_labelsEnabled' not in globals():
   g_labelsEnabled = False
 
+# Sticky: see core/transform.py's _logOnce for why -- this is the
+# last-resort catch-all for anything not already specifically
+# identified by transform.py/overlay.py's own sticky diagnostics below.
+if 'g_overlayUpdateErrorLogged' not in globals():
+  g_overlayUpdateErrorLogged = False
+
 # F2/F3 are already used by wotstat-vegetation's own toggle keys (see
 # CONCEPT.md: "pick unused keys to avoid conflicts if both mods are
 # installed together").
@@ -37,6 +43,7 @@ _LABELS_TOGGLE_KEY = Keys.KEY_F5
 
 
 def _overlayUpdate():
+  global g_overlayUpdateErrorLogged
   if not g_overlayEnabled:
     return  # toggled off -- stop rescheduling, this is the last tick
   try:
@@ -48,8 +55,15 @@ def _overlayUpdate():
         overlay.render(checkpoints, ports, exposures=exposures, showLabels=g_labelsEnabled)
   except Exception as e:
     # A rendering hiccup on one frame shouldn't kill the whole loop --
-    # still reschedule below either way.
-    log('overlay update error: ' + str(e))
+    # still reschedule below either way. Sticky/one-time: transform.py
+    # and overlay.py already log specific, named failures for anything
+    # they can anticipate; if execution reaches here it's something
+    # neither of them caught, so log it once rather than spamming an
+    # unidentified error every frame.
+    if not g_overlayUpdateErrorLogged:
+      g_overlayUpdateErrorLogged = True
+      log('overlay update error (unidentified -- not caught more specifically '
+          'in transform.py/overlay.py): ' + str(e))
   BigWorld.callback(0, _overlayUpdate)
 
 
