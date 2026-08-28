@@ -1,5 +1,7 @@
 ### | [RU](./README.md) | EN |
 
+# Inspired by Wotstat-vegetation mod
+
 # WotStat Spotting
 
 A mod that visualizes your own vehicle's spotting geometry — the 6
